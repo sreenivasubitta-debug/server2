@@ -1,0 +1,368 @@
+#!/opt/assure1/bin/RunScript
+BEGIN { push(@INC, "/usr/share/perl5","/usr/lib64/perl5"); }
+
+################################################################################################################################
+# File : CAPM_Alias_VLAN.pl
+# Author :  TCS
+# Description : This rules file would be used to Create Alias for CAPM VLAN.
+# Input  :
+# Output :
+# Date Modified : 27-Oct-2023
+################################################################################################################################
+use threads;
+use threads::shared;
+use DBI;
+use Assure1::Log;
+use Assure1::Core;
+use Assure1::Utils;
+use Assure1::Metrics;
+use XML::Simple;
+use Data::Dumper;
+use Assure1::Graph;
+
+my $LogLevel = 'DEBUG';
+my $LogFile  = '/opt/assure1/logs/CAPM_Alias_VLAN.log';
+our $Log = new Assure1::Log({
+                'LogFile'  => $LogFile,
+                'LogLevel' => $LogLevel
+});
+
+$Log->Message("ALWAYS","Started Create CAPM Alias");
+
+$xml = new XML::Simple;
+my $Config = Assure1::Config->new({ 'configPath' => '/opt/assure1/etc/Assure1.conf' });
+
+## Setup DB Connection
+$Log->Message("INFO","Connecting to DataBase !!");
+
+my $dbh = DBConnect($Config, 'Assure1', {AutoCommit => 1}) or die "Unable to connect: $DBI::errstr\n";
+if(!$dbh)
+{
+        $Log->Message("WARN","DB Connect Failed, Trying again");
+        sleep int(rand(10)+1);
+        $dbh = DBConnect($Config, 'Assure1', {AutoCommit => 1}) || $Log->Message("WARN","Cannot Open Connection to Database: " . $DBI::errstr);
+}
+if(!$dbh)
+{
+        $Log->Message("WARN","Execution Finished: DataBase Connect Failed, Even After Retry !!");
+        next;
+}
+
+
+my $graphNDB = NDBConnect($Config, {timeout => 5}) || die('cannot open connection to the NEO DB Graph database: '.$main::ndberrstr);
+if(!$graphNDB)
+{
+$Log->Message("WARN","Graph DB Connect Failed, Trying again");
+sleep int(rand(10)+1);
+$graphNDB = NDBConnect($Config, {timeout => 5}) || die('cannot open connection to the NEO DB Graph database: '.$main::ndberrstr);
+}
+if(!$graphNDB)
+{
+$Log->Message("WARN","Execution Finished: Graph DataBase Connect Failed, Even After Retry !!");
+next;
+}
+$FindifAliasSQL="match p = (d:Device)-->(i:Interface)-->(q:META:IPAddress ) where exists (q.IPAddress) return q.IPAddress,d.Name as FullName,i.Name as Instance;";
+$Log->Message("INFO","Executing Graph Query : $FindifAliasSQL");
+$Log->Message("INFO","Executing TOPOLOGY CHECK Graph Query : $TopologyCheckGraph");
+my ($message, @records) = ExecuteCypherQuery({
+                        CypherQuery   => $FindifAliasSQL,
+                        NDB     => \$graphNDB});
+if ($message)
+{
+$Log->Message('ERROR', "Failure in executing Graph Query : ".$message);
+}
+else
+{
+#$Log->Message('DEBUG', "Successfully executed Graph Query ".scalar(@records));
+}
+my $grhash;
+foreach my $grref(@records){
+my $y= (split(',',$grref->{'row'}[2]))[0];
+my $x="$grref->{'row'}[1]-$y";
+$grhash->{$x}=$grref->{'row'}[0];
+}
+#Hash Creation
+my $sisql_1="select concat(PEHostName,'-',PEInterfaceName) as kval,VRFID from Cramer.VRFTopologyInfo_ALU UNION select concat(PEHostName,'-',PEInterfaceName) as kval,VRFID from Cramer.VRFTopologyInfo  UNION select concat(PEHostName,'-',PEInterfaceName) as kval,VRFID from Cramer.VRFIDInfo_ALU_FLT UNION SELECT CONCAT(DNSName,'-',IfName) AS kval,VRFID FROM Cramer.Alcatel_vrfid_temp UNION select concat(DNSName,'-',IfName) as kval,VRFID from Cramer.AlcatelVRFIDCategorization";
+$Log->Message("DEBUG","sisql_1 = $sisql_1");
+my $vrf_hash=$dbh->selectall_hashref("$sisql_1","kval");
+
+my $incsql="select DeviceID,CONCAT(DeviceID,'-',IfDescr) AS ke from Cramer.DeviceInterfacesCategorization where InterfaceCategory =\"C\"  UNION select DeviceID,CONCAT(DeviceID,'-',IfDescr) AS ke from Cramer.DeviceInterfacesCategorization_ALU where InterfaceCategory =\"C\"";
+my $m_dc_hash=$dbh->selectall_hashref("$incsql","ke");
+
+my $sql_cus="select distinct Customer_Name,Cust_Acro from Cramer.Cust_Acro_Mapping";
+my $cust_ac_name=$dbh->selectall_hashref("$sql_cus","Customer_Name");
+
+my $sisql="Select DeviceID,SysName from DeviceSystemInfo";
+my $DeviceSystemInfoHash=$dbh->selectall_hashref("$sisql","DeviceID");
+
+my $mysql_ind="Select IfIndex,CONCAT(DeviceID,'-',IfDescr) AS ke from DeviceInterfaces where IfAlias not like '\%IOR\%'  UNION Select IfIndex,CONCAT(DeviceID,'-',IfDescr) AS ke from Cramer.DeviceInterfacesStatus_ALU where InterfaceStatus = 'Active'";
+my $m_ifind_hash=$dbh->selectall_hashref("$mysql_ind","ke");
+
+my $sisql1="select *,concat(PE_Name,'-',PE_Interface) as ke from Cramer.Instance_Alias_3 where CUID = '' and AliasType='PE'";
+my $alias_hash=$dbh->selectall_hashref("$sisql1","ke");
+my $sisql11="select *,concat(PE_Name,'-',PE_Interface) as ke from Cramer.Instance_Alias_3 ";
+my $alias_hash_all=$dbh->selectall_hashref("$sisql11","ke");
+
+my $msql= "SELECT * FROM Cramer.UpdatedPMSServiceRecordsDaily WHERE NAME NOT IN (SELECT MasterVRFID FROM Cramer.UpdatedPMSServiceRecordsDaily WHERE  MasterVRFID <> '') AND Vlan LIKE '\%,\%' ";
+my $devhash=$dbh->selectall_arrayref($msql, { 'Slice' => {} });
+my $ex_co=0;
+open(FH, ">/opt/assure1/var/checkouts/core/CustomScripts/Scripts/CAPM/interface_pe_VLAN.csv") or $Log->Message("DEBUG","File Couldnt be opened.");
+foreach my $dev ( @$devhash ) {
+my $sym=':';
+my $fp;
+my $sp;
+if($dev->{'Circuit2AEndPortName'}=~/(.)\.(.)/){
+
+$fp=$1.'.';Cramer
+$sp=$2;
+}elsif($dev->{'Circuit2AEndPortName'}=~/(.):(.)/){
+
+$fp=$1.':';
+$sp=$2;
+}else{
+if($dev->{'Circuit2AEndPortName'}=~m/^[0-9]/ || $dev->{'Circuit2AEndPortName'}=~m/^xe/i || $dev->{'Circuit2AEndPortName'}=~m/^Lag/i){
+$sym=':';
+}elsif($dev->{'Circuit2AEndPortName'}=~m/^Gi/i){
+$sym='.';}
+$fp=$dev->{'Circuit2AEndPortName'}.$sym;
+}
+my $al_ke="$dev->{'Circuit2ANodeAlias1'}-$dev->{'Circuit2AEndPortName'}";
+my $phash=$alias_hash_all->{$al_ke};
+#Check if Alias exists of Element Name
+if($phash){
+foreach my $vlan(split(',',$dev->{'VLAN'}))
+{
+if($vlan != $sp) {
+my $n_int=$fp.$vlan;
+
+my $alhash;
+my $a_ke="$dev->{'Circuit2ANodeAlias1'}-${n_int}";
+my $a_ke_1="$dev->{'Circuit2ANodeAlias1'}-${n_int}.0";
+if(exists $alias_hash->{$a_ke}){
+	$alhash=$alias_hash->{$a_ke};
+}elsif(exists $alias_hash->{$a_ke_1}){
+	$alhash=$alias_hash->{$a_ke_1};
+}
+#enrich alias
+my $m_ke="$phash->{'DeviceID'}-$n_int";
+my $m_ke_1="$phash->{'DeviceID'}-${n_int}.0";
+my $m_fl=0;
+my $fl_0=0;
+if(exists $m_dc_hash->{$m_ke}){$m_fl=1;}
+elsif(exists $m_dc_hash->{$m_ke_1}){$m_fl=1; $n_int="$n_int.0";$fl_0=1;}
+if($m_fl==0){next;}
+if($alhash){
+$al_id.="$alhash->{'Alias_ID'},";
+my $istr=$n_int;
+if($istr=~s/TenGigabitEthernet/Te/ig){
+}elsif($istr=~s/GigabitEthernet/Gi/ig){
+}elsif($istr=~s/POS/PO/ig){
+}elsif($istr=~s/Port-channel/Po/ig){
+}elsif($istr=~s/Loopback/Lo/ig){
+}elsif($istr=~s/CTunnel/CT/ig){
+}elsif($istr=~s/Tunnel/Tu/ig){
+}elsif($istr=~s/FastEthernet/Fa/ig){
+}elsif($istr=~s/Ethernet/Et/ig){
+}elsif($istr=~s/Serial/Se/ig){
+}elsif($istr=~s/GE-WAN/GE/ig){
+}elsif($istr=~s/Vlan/Vl/ig){
+}elsif($istr=~s/Multilink/Mu/ig){
+}elsif($istr=~s/BRI/BR/ig){
+}elsif($istr=~s/Lex/Le/ig){
+}elsif($istr=~s/Virtual-Access/Vi/ig){
+}elsif($istr=~s/Dialer/Di/ig){
+}elsif($istr=~s/Hssi/Hs/ig){
+}elsif($istr=~s/Async/As/ig){
+}elsif($istr=~s/CH-SONET/CH/ig){
+}elsif($istr=~s/MFR/MF/ig){
+}
+
+my $vrf_k="$phash->{'PE_Name'}-$istr";
+my $ele;
+if(exists $DeviceSystemInfoHash->{$phash->{'DeviceID'}}){
+if($DeviceSystemInfoHash->{$phash->{'DeviceID'}}->{'SysName'}){
+$ele=$DeviceSystemInfoHash->{$phash->{'DeviceID'}}->{'SysName'}.'-'.$istr;
+}else{
+$ele="$phash->{'PE_Name'}-$istr";
+}
+}else{
+$ele="$phash->{'PE_Name'}-$istr";
+}
+my $vrfid;
+if(exists $vrf_hash->{$vrf_k}){
+$ele=$ele.'-Vrf'.$vrf_hash->{$vrf_k}->{'VRFID'};
+$vrfid='Vrf'.$vrf_hash->{$vrf_k}->{'VRFID'};
+}
+
+
+my $AliasName=$phash->{'AliasName'};
+if($sp){
+$AliasName=~s/(.*)($sp)/$1$vlan/;
+}else{$AliasName=$AliasName."$sym".$vlan;}
+my $PE_Interface=$phash->{'PE_Interface'};
+if($sp){$PE_Interface=~s/(.*)($sp)/$1$vlan/;}else{$PE_Interface=$PE_Interface."$sym".$vlan;}
+
+my $ifkey="$phash->{'DeviceID'}-$PE_Interface";							
+my $IFIndex=$m_ifind_hash->{$ifkey}->{'IfIndex'};
+if($fl_0==1){$PE_Interface="${PE_Interface}.0";$AliasName="${AliasName}.0";}
+                                my $tstr="$phash->{'PE_Name'}-$PE_Interface";
+                                my $gr_ip;
+                                if(exists $grhash->{$tstr}){
+                                $gr_ip=$grhash->{$tstr};
+                                }
+
+
+print FH "\"$phash->{'AliasType'}\"|#|\"$AliasName\"|#|\"$ele\"|#|\"$phash->{'PE_Name'}\"|#|\"$PE_Interface\"|#|\"\"|#|\"$phash->{'CUID'}\"|#|\"0\"|#|\"$phash->{'DeviceID'}\"|#|\"$phash->{'Group_Name'}\"|#|\"$phash->{'GVPNType'}\"|#|\"$phash->{'EVENTSOURCEID'}\"|#|\"$phash->{'ServiceID'}\"|#|\"$phash->{'SERVICETYPENAME'}\"|#|\"$phash->{'Bandwidth'}\"|#|\"$phash->{'IPAddress'}\"|#|\"$IFIndex\"|#|\"$phash->{'DeviceName_Inventory'}\"|#|\"$PE_Interface\"|#|\"$gr_ip\"|#|\"$vrfid\"\n";
+}
+}
+}
+}else {
+foreach my $vlan(split(',',$dev->{'VLAN'}))
+{
+my $n_int=$fp.$vlan;
+
+my $alhash;
+my $a_ke="$dev->{'Circuit2ANodeAlias1'}-${n_int}";
+my $a_ke_1="$dev->{'Circuit2ANodeAlias1'}-${n_int}.0";
+if(exists $alias_hash->{$a_ke}){
+	$alhash=$alias_hash->{$a_ke};
+}elsif(exists $alias_hash->{$a_ke_1}){
+	$alhash=$alias_hash->{$a_ke_1};
+}
+#enrich Alias
+if($alhash){
+my $m_ke="$alhash->{'DeviceID'}-$n_int";
+my $m_ke_1="$alhash->{'DeviceID'}-${n_int}.0";
+my $m_fl=0;
+my $fl_0=0;
+if(exists $m_dc_hash->{$m_ke}){$m_fl=1;}
+elsif(exists $m_dc_hash->{$m_ke_1}){$m_fl=1; $n_int="$n_int.0";$fl_0=1;}
+if($m_fl==0){next;}
+my $deviceid = $alhash->{'DeviceID'};
+my $ip=$alhash->{'IPAddress'};
+
+$al_id.="$alhash->{'Alias_ID'},";
+my $int_name=$n_int;
+
+my $a_cust=$dev->{'CustomerName'};
+if(exists $cust_ac_name->{$dev->{'CustomerName'}}){
+$dev->{'CustomerName'}=$cust_ac_name->{$dev->{'CustomerName'}}->{'Cust_Acro'};$a_cust=$dev->{'CustomerName'};
+}else{
+$dev->{'CustomerName'}=~s/(.?)\s$/$1/g;
+$dev->{'CustomerName'}=~s/\s+/ /g;
+my @y=split(" ",$dev->{'CustomerName'});
+if($#y >0){$dev->{'CustomerName'}="$y[0]_$y[1]";}
+}
+$dev->{'CustomerName'}=~s/\s+/_/g;
+$dev->{'CustomerName'}=~s/[\-,\.]//g;
+$a_cust=~s/\s+/_/g;
+$a_cust=~s/[\-,\.]//g;
+
+my $istr=$int_name;
+if($istr=~s/TenGigabitEthernet/Te/ig){
+}elsif($istr=~s/GigabitEthernet/Gi/ig){
+}elsif($istr=~s/POS/PO/ig){
+}elsif($istr=~s/Port-channel/Po/ig){
+}elsif($istr=~s/Loopback/Lo/ig){
+}elsif($istr=~s/CTunnel/CT/ig){
+}elsif($istr=~s/Tunnel/Tu/ig){
+}elsif($istr=~s/FastEthernet/Fa/ig){
+}elsif($istr=~s/Ethernet/Et/ig){
+}elsif($istr=~s/Serial/Se/ig){
+}elsif($istr=~s/GE-WAN/GE/ig){
+}elsif($istr=~s/Vlan/Vl/ig){
+}elsif($istr=~s/Multilink/Mu/ig){
+}elsif($istr=~s/BRI/BR/ig){
+}elsif($istr=~s/Lex/Le/ig){
+}elsif($istr=~s/Virtual-Access/Vi/ig){
+}elsif($istr=~s/Dialer/Di/ig){
+}elsif($istr=~s/Hssi/Hs/ig){
+}elsif($istr=~s/Async/As/ig){
+}elsif($istr=~s/CH-SONET/CH/ig){
+}elsif($istr=~s/MFR/MF/ig){
+}
+
+
+my $na;
+my $groupname;
+my $GVPNType=$dev->{'GVPNType'};
+my $ILLIASType=$dev->{'ILLIASType'};
+my $EVENTSOURCEID=$dev->{'EVENTSOURCEID'};
+my $SERVICETYPENAME=$dev->{'SERVICETYPENAME'};
+my $bandwidth;
+my $PRISEC=$dev->{'PRISEC'};
+my $ps;
+my $A_END_SITE_CITY=$dev->{'A_END_SITE_CITY'};
+$groupname="$dev->{'CustomerName'}-$dev->{'CUID'}-PE";if($PRISEC =~m/SINGLE/i){$ps = 'SIN';}
+elsif($PRISEC =~m/PRIMARY/i){$ps = 'PRI';}
+elsif($PRISEC =~m/SECONDARY/i){$ps = 'SEC';}
+$A_END_SITE_CITY=~s/\s+/_/g;
+$A_END_SITE_CITY=~s/[\-,\.]//g;
+
+my $CIRCUITSPEEDUNIT=lc($dev->{'CIRCUITSPEEDUNIT'});
+my $CIRCUITSPEED=$dev->{'CIRCUITSPEED'};
+if($CIRCUITSPEED>=1000){
+$CIRCUITSPEED=$CIRCUITSPEED/1000;
+if($CIRCUITSPEEDUNIT=~m/kb/i){
+$CIRCUITSPEEDUNIT="Mb";
+}elsif($CIRCUITSPEEDUNIT=~m/mb/i){
+$CIRCUITSPEEDUNIT="Gb";
+}elsif($CIRCUITSPEEDUNIT=~m/gb/i){
+$CIRCUITSPEEDUNIT="Tb";
+}elsif($CIRCUITSPEEDUNIT=~m/tb/i){
+$CIRCUITSPEEDUNIT="Pb";
+}else{
+$CIRCUITSPEED=$CIRCUITSPEED*1000;
+}
+}else{
+if($CIRCUITSPEEDUNIT=~m/kb/i){
+$CIRCUITSPEEDUNIT="Kb";
+}elsif($CIRCUITSPEEDUNIT=~m/mb/i){
+$CIRCUITSPEEDUNIT="Mb";
+}elsif($CIRCUITSPEEDUNIT=~m/gb/i){
+$CIRCUITSPEEDUNIT="Gb";
+}elsif($CIRCUITSPEEDUNIT=~m/tb/i){
+$CIRCUITSPEEDUNIT="Tb";
+}
+}
+$na = "$a_cust-$A_END_SITE_CITY-$CIRCUITSPEED$CIRCUITSPEEDUNIT-$dev->{'NAME'}-$dev->{'SERVICETYPENAME'}-$ps-PE-$istr";
+my $vrf_k="$dev->{'Circuit2ANodeAlias1'}-$istr";
+my $ele;
+if(exists $DeviceSystemInfoHash->{$deviceid}){
+if($DeviceSystemInfoHash->{$deviceid}->{'SysName'}){
+$ele=$DeviceSystemInfoHash->{$deviceid}->{'SysName'}.'-'.$istr;
+}else{
+$ele="$dev->{'Circuit2ANodeAlias1'}-$istr";
+}
+}else{
+$ele="$dev->{'Circuit2ANodeAlias1'}-$istr";
+}
+my $vrfid;
+if(exists $vrf_hash->{$vrf_k}){
+$ele=$ele.'-Vrf'.$vrf_hash->{$vrf_k}->{'VRFID'};
+$vrfid='Vrf'.$vrf_hash->{$vrf_k}->{'VRFID'};
+}
+
+($na)=~s/&/_/g;
+($na)=~s/+//g;
+$na=~s/_//g;
+$groupname=~s/_//g;
+$na=~s/["']/_/g;
+$groupname=~s/["']/_/g;
+my $ifkey="$deviceid-$int_name";							
+my $IFIndex=$m_ifind_hash->{$ifkey}->{'IfIndex'};
+
+print FH "\"PE\"|#|\"$na\"|#|\"$ele\"|#|\"$dev->{'Circuit2ANodeAlias1'}\"|#|\"$int_name\"|#|\"\"|#|\"$dev->{'CUID'}\"|#|\"0\"|#|\"$deviceid\"|#|\"$groupname\"|#|\"$GVPNType\"|#|\"$EVENTSOURCEID\"|#|\"$dev->{'NAME'}\"|#|\"$SERVICETYPENAME\"|#|\"$CIRCUITSPEED$CIRCUITSPEEDUNIT\"|#|\"$ip\"|#|\"$IFIndex\"|#|\"$DeviceSystemInfoHash->{$deviceid}->{'SysName'}\"|#|\"$int_name\"|#|\"$gr_ip\"|#|\"$vrfid\"\n";
+}
+}
+
+}
+}
+chop($al_id);
+#table changes
+my $qsql=$dbh->prepare("delete from Cramer.Instance_Alias_3 where Alias_ID in ($al_id)");
+$qsql->execute();
+my $isql=$dbh->prepare("LOAD DATA LOCAL INFILE '/opt/assure1/var/checkouts/core/CustomScripts/Scripts/CAPM/interface_pe_VLAN.csv' IGNORE INTO TABLE Cramer.Instance_Alias_3
+ FIELDS TERMINATED BY '|#|' ENCLOSED BY '\"' LINES TERMINATED BY '\\n' 
+ ( AliasType, AliasName, ElementName, PE_Name, PE_Interface, Instance_Name, CUID, MetricID, DeviceID, Group_Name, GVPNType, EVENTSOURCEID, ServiceID, SERVICETYPENAME, Bandwidth, IPAddress, Ifindex, DeviceName_Inventory, InstanceName_Inventory, Graph_IP, VRFID) set Alias_ID=NULL,Terminated_Date=NULL;");
+my $ires=$isql->execute();
